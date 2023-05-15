@@ -1,0 +1,407 @@
+#include <Wire.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <SPI.h>
+#include <Adafruit_BMP280.h>
+#include <DHT.h>
+#include "time.h"
+#include "sntp.h"
+#include <math.h>
+#include "Adafruit_GFX.h"
+#include "Adafruit_ILI9341.h"
+#include <GyverBME280.h> 
+#ifndef ARDUINOJSON_H
+#include <ArduinoJson.h>
+#endif
+
+#define BMP_SCK  (13)
+#define BMP_MISO (12)
+#define BMP_MOSI (11)
+#define BMP_CS   (10)
+#define DHTPIN 4
+#define DHTTYPE DHT22
+#define Soil_Moisture 32
+#define TFT_DC 17
+#define TFT_CS 5
+#define TFT_RST 16
+#define TFT_CLK 18
+#define TFT_MOSI 23
+#define TFT_MISO 19
+
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_MOSI, TFT_CLK, TFT_RST, TFT_MISO);
+GyverBME280 bme;  
+DHT dht(DHTPIN, DHTTYPE);
+Adafruit_BMP280 bmp; // I2C
+
+
+
+// extern uint16_t celsius[0x1A4];
+//Adafruit_BMP280 bmp(BMP_CS); // hardware SPI
+//Adafruit_BMP280 bmp(BMP_CS, BMP_MOSI, BMP_MISO,  BMP_SCK);
+float R = 8.31446261815324;
+float M = 28.97;
+float g = 9.80665;
+int percent = 0;
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+// Replace the next variables with your SSID/Password combination
+
+const char* ssid          = "ANDRE3379";
+const char* password      = "891z2N|6";
+// const char* ssid          = "Samsung Galaxy J3 Prime 0903";
+// const char* password      = "";
+const char* mqtt_server   = "www.yanacreations.com";
+const char* mqtt_SubTopic = "620108055_Project";       //Replace with your ID number ex. 620012345_Project
+const char* IDNumber      = "620108055";            //Replace with your ID number ex. 620012345
+
+const char* ntpServer1 = "pool.ntp.org";
+const char* ntpServer2 = "time.nist.gov";
+const long  gmtOffset_sec = 3600;
+const int   daylightOffset_sec = 3600;
+
+const char* device_name   = IDNumber;
+const char* mqtt_PubTopic = IDNumber; 
+const char* time_zone = "CET-1CEST,M3.5.0,M10.5.0/3";  // TimeZone rule for Europe/Rome including daylight adjustment rules (optional)
+
+void reconnect();
+void setup_wifi();
+void callback(char* topic, byte* message, unsigned int length);
+int Timestamp = 0;
+
+void printLocalTime()
+{
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo)){
+    Serial.println("No time available (yet)");
+    return;
+  }
+  Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+}
+// //////////////////
+unsigned long getTime(){
+// RETURNS TIMESTAMP FOR CURRENT TIME FROM NTP SERVER
+    time_t now;
+    struct tm timeinfo;
+
+    // get time from ntp server first and save to system
+    if (!getLocalTime(&timeinfo)) {
+      log_d("%s","Failed to obtain time, NTP");
+      return(0);
+    }
+
+    // Retrieve time[Timestamp] from system and save to &now variable
+    time(&now); 
+    return now;  
+    }
+// ///////////////////////////////////
+int TimeStamp(void){
+      // RETURNS TIMESTAMP FOR CURRENT TIME
+      time_t now;
+      
+      // Retrieve time[Timestamp] from system and save to &now variable
+      time(&now);
+      Timestamp = (int)now;
+      return now;
+      }
+
+// Callback function (get's called when time adjusts via NTP)
+void timeavailable(struct timeval *t)
+{
+  Serial.println("Got time adjustment from NTP!");
+  Serial.println("***SYNCHRONIZED***");
+  printLocalTime();
+}
+
+void setup() {
+  Serial.begin(115200);  // start serial for output
+  setup_wifi();
+  dht.begin();
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
+  bme.begin(); 
+  Wire.begin();        // join i2c bus (address optional for master)
+  tft.begin();
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(2);
+  pinMode(Soil_Moisture, INPUT);
+
+  getTime();
+
+  sntp_set_time_sync_notification_cb( timeavailable );
+
+  /**
+   * NTP server address could be aquired via DHCP,
+   *
+   * NOTE: This call should be made BEFORE esp32 aquires IP address via DHCP,
+   * otherwise SNTP option 42 would be rejected by default.
+   * NOTE: configTime() function call if made AFTER DHCP-client run
+   * will OVERRIDE aquired NTP server address
+   */
+  sntp_servermode_dhcp(1);    // (optional)
+
+  /**
+   * This will set configured ntp servers and constant TimeZone/daylightOffset
+   * should be OK if your time zone does not need to adjust daylightOffset twice a year,
+   * in such a case time adjustment won't be handled automagicaly.
+   */
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2);
+
+  /**
+   * A more convenient approach to handle TimeZones with daylightOffset 
+   * would be to specify a environmnet variable with TimeZone definition including daylight adjustmnet rules.
+   * A list of rules for your zone could be obtained from https://github.com/esp8266/Arduino/blob/master/cores/esp8266/TZ.h
+   */
+  //configTzTime(time_zone, ntpServer1, ntpServer2);
+
+
+
+
+
+  while ( !Serial ) delay(100);   // wait for native usb
+  Serial.println(F("BMP280 test"));
+  unsigned status;
+  //status = bmp.begin(BMP280_ADDRESS_ALT, BMP280_CHIPID);
+  // status = bmp.begin(0x76);
+  if (!bmp.begin(0x76)) {
+    Serial.println(F("Could not find a valid BMP280 sensor, check wiring or "
+                      "try a different address!"));
+    Serial.print("SensorID was: 0x"); Serial.println(bmp.sensorID(),16);
+    Serial.print("        ID of 0xFF probably means a bad address, a BMP 180 or BMP 085\n");
+    Serial.print("   ID of 0x56-0x58 represents a BMP 280,\n");
+    Serial.print("        ID of 0x60 represents a BME 280.\n");
+    Serial.print("        ID of 0x61 represents a BME 680.\n");
+    while (1) delay(10);
+  }
+
+  /* Default settings from datasheet. */
+  bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,     /* Operating Mode. */
+                  Adafruit_BMP280::SAMPLING_X2,     /* Temp. oversampling */
+                  Adafruit_BMP280::SAMPLING_X16,    /* Pressure oversampling */
+                  Adafruit_BMP280::FILTER_X16,      /* Filtering. */
+                  Adafruit_BMP280::STANDBY_MS_500); /* Standby time. */
+}
+
+void loop() 
+{
+    if (!client.connected()) {
+        reconnect();
+      }
+      client.loop();    
+
+    
+    int Soil_Info = analogRead(Soil_Moisture);
+    int conv = map(Soil_Info, 5, 2100, 0, 100);
+    
+    Timestamp = TimeStamp();
+  
+    Serial.println(Soil_Info);
+    float Temp = dht.readTemperature();
+    float H_Index = dht.computeHeatIndex(dht.readTemperature(),dht.readHumidity(),false);
+    float Hum = dht.readHumidity();
+    float P = bmp.readPressure();
+    float pa = (bmp.readPressure()-23875.39)/1000;
+    // float pressure = bme.readPressure(); 
+    float h = (-R*(Temp+273.15) / (M*g)) *-17*(P /101325);
+    // float h = (-R*(Temp+273.15) / (M*g)) *log(P /1013.25);
+    float Altitude = pressureToAltitude(bmp.readPressure());
+    Serial.print(F("Temperature = "));
+    Serial.print(dht.readTemperature());
+    Serial.println("°C");
+
+    // Serial.print(F("Temperature BMP = "));
+    // Serial.print(bmp.readTemperature());
+    // Serial.println("°C");
+
+    
+
+    Serial.print(F("Pressure = "));
+    Serial.print(bmp.readPressure());
+    Serial.println("Pa");
+
+    // Serial.print(F("Pressure Mercury = "));
+    // Serial.print(pressureToMmHg(pressure));     // Выводим давление в [мм рт. столба]
+    // Serial.println(" mm Hg");
+
+    Serial.print("BME  Altitide: ");
+    Serial.print(pressureToAltitude(bmp.readPressure())); // Выводим высоту в [м над ур. моря]
+    Serial.println(" m");
+
+   
+
+    // Serial.print(F("Approx altitude = "));
+    // Serial.print(bmp.readAltitude(P/1000)); /* Adjusted to local forecast! */
+    // Serial.println(" m");
+
+    // Serial.print(F("Altitude = "));
+    // Serial.print(h); /* Adjusted to local forecast! */
+    // Serial.println(" m");
+
+    Serial.print(F("Humidity = "));
+    Serial.print(dht.readHumidity());
+    Serial.println("%");
+
+    Serial.print(F("Heat Index = "));
+    Serial.print(dht.computeHeatIndex(dht.readTemperature(),dht.readHumidity(),false));
+    Serial.println("°C");
+
+    Serial.print(F("Soil = "));
+    Serial.print(conv);
+    Serial.println("%");
+    Serial.println();
+
+
+    Wire.requestFrom(8, 6);    // request 6 bytes from peripheral device #8
+        
+    if (tft.getCursorY() >= 320) {
+    tft.fillScreen(ILI9341_BLACK);
+    tft.setCursor(0, 0);
+  }
+
+
+  tft.print("Temp = ");
+  tft.print(dht.readTemperature());
+  tft.println(" C");
+
+  tft.print("H_Index = ");
+  tft.print(dht.computeHeatIndex(dht.readTemperature(),dht.readHumidity(),false));
+  tft.println(" C");
+
+  tft.print("Humidity = ");
+  tft.print(dht.readHumidity());
+  tft.println("%");
+
+  // tft.print("Pressure = ");
+  // tft.print((bmp.readPressure()-23875.39)/1000);
+  // tft.println("kPa");
+
+  tft.print("Pressure = ");
+  tft.print((bmp.readPressure())/1000);
+  tft.println("kPa");
+
+
+
+  // tft.print("Altitude = ");
+  // tft.print(h);
+  // tft.println("m");
+
+
+  tft.print("Altitude = ");
+  tft.print(pressureToAltitude(bmp.readPressure()));
+  tft.println("m");
+
+  
+  if (conv < 100)
+  {
+  tft.print("Soil Moisture = ");
+  tft.print(conv);
+  tft.println("%");
+  tft.println(" ");
+  }
+  if(conv >= 100)
+  {
+  tft.print("Soil Moisture = ");
+  tft.print(100);
+  tft.println("%");
+  tft.println(" ");
+  }
+    
+
+  static int capacity  = JSON_OBJECT_SIZE(50); 
+  DynamicJsonDocument json(capacity);
+  
+  char message[300]       = {0};
+  json["TYPE"]            = "SENSOR";
+  json["ID"]              = IDNumber;
+  json["TEMPERATURE"]     = Temp;
+  json["HEATINDEX"]       = H_Index;
+  json["HUMID"]           = Hum; 
+  json["PRESSURE"]        = P;
+  json["ALTITUDE"]        = Altitude;
+  json["SOINMOISTURE"]    = conv;
+  json["TIMESTAMP"] = Timestamp;
+
+  serializeJson(json,message);   
+  json.clear(); 
+
+  Serial.println(message);
+  // client.publish(mqtt_PubTopic, message); 
+  // PUBLISH MESSAGE
+  if(Timestamp >= 167701500)
+  {
+    client.publish(mqtt_PubTopic, message); 
+  }
+    
+
+  
+  vTaskDelay(1000 / portTICK_PERIOD_MS); // delay 1 second  
+
+// delay(500);
+}
+
+void setup_wifi() {
+  vTaskDelay(10 / portTICK_PERIOD_MS);      // delay 10 ms 
+  
+  Serial.printf("\nConnecting to %s",ssid); // We start by connecting to a WiFi network
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    vTaskDelay(500 / portTICK_PERIOD_MS);    // delay 500 ms
+    Serial.print(".");
+  }
+
+  Serial.printf("\nWiFi connected! IP address: %s ", WiFi.localIP().toString().c_str());
+
+
+}
+
+void callback(char* topic, byte* message, unsigned int length) { 
+  
+  char received[1000] = {0};    
+  
+  for (int i = 0; i < length; i++) { 
+    received[i] = (char)message[i];    
+  } 
+
+  // PRINT RECEIVED MESSAGE
+  Serial.printf("Message received! \nTopic: %s \nPayload: %s\n",topic,received);
+
+  // TASKS
+  // 1. CONVERT 'received' TO JSON
+  DynamicJsonDocument doc(50);
+  deserializeJson(doc, received);
+
+
+  const char* sensor = doc["sensor"];
+  const char* data = doc["message"];
+  Serial.println(sensor);
+    String action = String(sensor);
+   
+    
+
+
+  }
+ 
+
+void reconnect(){
+  // Loop until we're reconnected
+  while (!client.connected()) {
+    Serial.println("\nAttempting MQTT connection...");
+
+    // Attempt to connect
+    if(client.connect(device_name)) {
+      Serial.println("MQTT connected");
+
+      // Subscribe
+      client.subscribe(mqtt_SubTopic);
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 2 seconds");
+       
+      vTaskDelay(2000 / portTICK_PERIOD_MS); // delay 2 second
+    }
+  }
+}
